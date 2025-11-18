@@ -1,0 +1,177 @@
+version: "3.8"
+
+networks:
+  n8n_net:
+    driver: bridge
+
+volumes:
+  n8n_data:
+  pg_data:
+  redis_data:
+  traefik_letsencrypt:
+
+services:
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.le.acme.tlschallenge=true
+      - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesresolvers.le.acme.storage=/letsencrypt/acme.json
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - traefik_letsencrypt:/letsencrypt
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - n8n_net
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - n8n_net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "PING"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - redis_data:/data
+    networks:
+      - n8n_net
+    restart: unless-stopped
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:${N8N_IMAGE_TAG}
+    # Não expõe porta para fora; Traefik faz o proxy com TLS
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      # --- Banco (Postgres) ---
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+
+      # --- Execuções / Queue Mode ---
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_PASSWORD=${REDIS_PASSWORD}
+      # Opcional: ativar health/readiness dos workers (ver nota abaixo)
+      # - QUEUE_HEALTH_CHECK_ACTIVE=true
+
+      # --- URLs e proxy reverso ---
+      - N8N_HOST=${N8N_HOST}
+      - N8N_PROTOCOL=https
+      - N8N_PORT=5678
+      - N8N_EDITOR_BASE_URL=https://${N8N_HOST}
+      - WEBHOOK_URL=https://${N8N_HOST}
+      - N8N_PROXY_HOPS=1
+
+      # --- Segurança ---
+      - NODE_ENV=production
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_SECURE_COOKIE=true
+      - N8N_SAMESITE_COOKIE=lax
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=true
+      # Bloqueia nós sensíveis (ex.: Execute Command)
+      - NODES_EXCLUDE=["n8n-nodes-base.executeCommand"]
+
+      # --- Observabilidade / Limites / Logs ---
+      - N8N_METRICS=true
+      - N8N_METRICS_INCLUDE_DEFAULT_METRICS=true
+      - N8N_PAYLOAD_SIZE_MAX=64        # MiB para webhooks
+      - N8N_FORMDATA_FILE_SIZE_MAX=200 # MiB
+      - N8N_LOG_LEVEL=info
+
+      # --- Pruning de execuções (ajuste conforme o volume) ---
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336            # horas (14 dias)
+      - EXECUTIONS_DATA_PRUNE_MAX_COUNT=200000 # limite por contagem
+
+      # --- Fuso horário ---
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - TZ=${TZ}
+
+      # --- API pública (desative se não usar) ---
+      - N8N_PUBLIC_API_DISABLED=${N8N_PUBLIC_API_DISABLED}
+      - N8N_PUBLIC_API_SWAGGERUI_DISABLED=${N8N_PUBLIC_API_SWAGGERUI_DISABLED}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.n8n.rule=Host(`${N8N_HOST}`)
+      - traefik.http.routers.n8n.entrypoints=websecure
+      - traefik.http.routers.n8n.tls.certresolver=le
+      - traefik.http.services.n8n.loadbalancer.server.port=5678
+      # Redireciona http->https
+      - traefik.http.routers.n8n-https-redirect.rule=Host(`${N8N_HOST}`)
+      - traefik.http.routers.n8n-https-redirect.entrypoints=web
+      - traefik.http.routers.n8n-https-redirect.middlewares=redirect-to-https
+      - traefik.http.middlewares.redirect-to-https.redirectscheme.scheme=https
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - n8n_net
+    restart: unless-stopped
+
+  n8n-worker:
+    image: docker.n8n.io/n8nio/n8n:${N8N_IMAGE_TAG}
+    depends_on:
+      n8n:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=${POSTGRES_DB}
+      - DB_POSTGRESDB_USER=${POSTGRES_USER}
+      - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
+
+      - EXECUTIONS_MODE=queue
+      - QUEUE_BULL_REDIS_HOST=redis
+      - QUEUE_BULL_REDIS_PORT=6379
+      - QUEUE_BULL_REDIS_PASSWORD=${REDIS_PASSWORD}
+
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - NODE_ENV=production
+
+      # (opcional) métricas/health do worker — veja nota abaixo
+      # - N8N_METRICS=true
+      # - QUEUE_HEALTH_CHECK_ACTIVE=true
+
+      - GENERIC_TIMEZONE=${GENERIC_TIMEZONE}
+      - TZ=${TZ}
+    command: ["n8n", "worker", "--concurrency", "${WORKER_CONCURRENCY}"]
+    networks:
+      - n8n_net
+    restart: unless-stopped
